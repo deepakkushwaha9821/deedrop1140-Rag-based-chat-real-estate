@@ -2,7 +2,7 @@ import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "./api";
 
-// ── Typewriter animation ─────────────────────────────────────────────────────
+
 function TypewriterText({ text, animate, onDone }) {
   const [visible, setVisible] = useState(animate ? "" : text);
 
@@ -21,7 +21,41 @@ function TypewriterText({ text, animate, onDone }) {
   return <>{visible}</>;
 }
 
-// ── Auth Page ────────────────────────────────────────────────────────────────
+const METRIC_LABELS = [
+  ["context_precision", "Context Precision"],
+  ["context_recall", "Context Recall"],
+  ["precision_at_k", "Precision@K"],
+  ["recall_at_k", "Recall@K"],
+  ["mrr", "MRR"],
+  ["map", "MAP"],
+  ["ndcg", "NDCG"],
+  ["faithfulness", "Faithfulness"],
+  ["answer_relevancy", "Answer Relevancy"],
+  ["correctness", "Correctness"],
+  ["hallucination_rate", "Hallucination Rate"],
+  ["semantic_similarity", "Semantic Similarity"],
+];
+
+function MetricChips({ metrics }) {
+  if (!metrics) return null;
+
+  return (
+    <div className="message-metrics">
+      {METRIC_LABELS.map(([key, label]) => {
+        const value = metrics[key];
+        if (value === undefined || value === null) return null;
+        return (
+          <span key={key} className="metric-chip" title={`${label}: ${value.toFixed(3)}`}>
+            <strong>{label}</strong>
+            <span>{`${(value * 100).toFixed(1)}%`}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+
 function AuthPage({ mode }) {
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
@@ -72,7 +106,7 @@ function AuthPage({ mode }) {
   );
 }
 
-// ── About Page ───────────────────────────────────────────────────────────────
+
 function AboutPage() {
   const [info, setInfo] = useState(null);
   useEffect(() => { api.get("/about").then(r => setInfo(r.data)); }, []);
@@ -99,7 +133,7 @@ function AboutPage() {
   );
 }
 
-// ── Welcome Screen ───────────────────────────────────────────────────────────
+
 function WelcomeScreen({ onNew }) {
   const features = [
     { icon: "🔍", title: "Property Search", desc: "Find properties by intent, budget & location" },
@@ -126,7 +160,7 @@ function WelcomeScreen({ onNew }) {
   );
 }
 
-// ── Chat Page ────────────────────────────────────────────────────────────────
+
 function ChatPage() {
   const navigate = useNavigate();
   const messagesEndRef = useRef(null);
@@ -166,12 +200,12 @@ function ChatPage() {
         if (data.length > 0) setActiveChatId(data[0].id);
       } catch { localStorage.removeItem("token"); navigate("/login"); }
     })();
-  }, []);
+  }, [refreshChats, navigate]);
 
   useEffect(() => {
     if (activeChatId) loadDetail(activeChatId);
     else { setMessages([]); setFiles([]); setTypingMessageId(null); }
-  }, [activeChatId]);
+  }, [activeChatId, loadDetail]);
 
   // Scroll on new messages / loading
   useEffect(() => {
@@ -231,9 +265,25 @@ function ChatPage() {
     } finally { e.target.value = ""; setUploadLoading(false); }
   };
 
-  const togglePin = async (id, e) => { e.stopPropagation(); await api.post(`/chats/${id}/pin`); await refreshChats(); };
-  const archiveChat = async (id, e) => { e.stopPropagation(); await api.post(`/chats/${id}/archive`); if (activeChatId === id) setActiveChatId(null); await refreshChats(); };
-  const deleteChat = async (id, e) => { e.stopPropagation(); await api.delete(`/chats/${id}`); if (activeChatId === id) setActiveChatId(null); await refreshChats(); };
+  const togglePin = async (id, e) => {
+    e.stopPropagation();
+    await api.post(`/chats/${id}/pin`);
+    await refreshChats();
+  };
+
+  const archiveChat = async (id, e) => {
+    e.stopPropagation();
+    await api.post(`/chats/${id}/archive`);
+    if (activeChatId === id) setActiveChatId(null);
+    await refreshChats();
+  };
+
+  const deleteChat = async (id, e) => {
+    e.stopPropagation();
+    await api.delete(`/chats/${id}`);
+    if (activeChatId === id) setActiveChatId(null);
+    await refreshChats();
+  };
   const logout = () => { localStorage.removeItem("token"); navigate("/login"); };
 
   const onKeyDown = (e) => { if (e.key === "Enter" && !e.shiftKey) sendMessage(e); };
@@ -259,7 +309,7 @@ function ChatPage() {
               {uploadLoading ? "⏳ Uploading…" : "📎 Upload Document"}
               <input id="file-upload" type="file" onChange={upload}
                 disabled={!activeChat || uploadLoading}
-                accept=".pdf,.txt,.md,.csv,.json" />
+                accept=".pdf,.txt,.md,.csv,.json,.png,.jpg,.jpeg,.bmp,.tiff,.tif,.webp" />
             </label>
             <p className="upload-hint">PDF · TXT · MD · CSV · JSON</p>
           </div>
@@ -322,6 +372,7 @@ function ChatPage() {
                     animate={msg.role === "ai" && msg.id === typingMessageId}
                     onDone={() => setTypingMessageId(cur => cur === msg.id ? null : cur)}
                   />
+                  {msg.role === "ai" && <MetricChips metrics={msg.metrics} />}
                 </div>
               ))}
 
@@ -362,12 +413,12 @@ function ChatPage() {
   );
 }
 
-// ── Protected Route ──────────────────────────────────────────────────────────
+
 function ProtectedRoute({ children }) {
   return localStorage.getItem("token") ? children : <Navigate to="/login" replace />;
 }
 
-// ── App ──────────────────────────────────────────────────────────────────────
+
 export default function App() {
   return (
     <Routes>
