@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Generator
 
@@ -7,21 +8,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from langchain_core.messages import AIMessage, HumanMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 try:
-    from .config import Config
-    from .lang_service import clear_chat_rag_data, create_vectorstore, get_rag_response
-    from .langgraph_service import get_response
-    from .models import Chat, Message, SessionLocal, UploadedFile as ModelUploadedFile, User, init_db
-except ImportError:
     from config import Config
-    from lang_service import clear_chat_rag_data, create_vectorstore, get_rag_response
+    from lang_service import clear_rag_data, create_vectorstore, get_rag_response
     from langgraph_service import get_response
     from models import Chat, Message, SessionLocal, UploadedFile as ModelUploadedFile, User, init_db
+except ImportError:
+    from .config import Config
+    from .lang_service import clear_rag_data, create_vectorstore, get_rag_response
+    from .langgraph_service import get_response
+    from .models import Chat, Message, SessionLocal, UploadedFile as ModelUploadedFile, User, init_db
 
 
 app = FastAPI(
@@ -40,18 +41,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_FOLDER = Config.UPLOAD_DIR
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(Config.UPLOAD_DIR, exist_ok=True)
 os.makedirs(Config.VECTORSTORE_DIR, exist_ok=True)
 init_db()
 
 
-class RegisterInput(BaseModel):
-    username: str
-    password: str
-
-
-class LoginInput(BaseModel):
+class AuthInput(BaseModel):
     username: str
     password: str
 
@@ -62,11 +57,13 @@ class TokenResponse(BaseModel):
 
 
 class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     username: str
 
 
 class ChatOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     user_id: int
     title: str
@@ -81,14 +78,17 @@ class MessageInput(BaseModel):
 
 
 class MessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     chat_id: int
     role: str
     content: str
+    metrics: dict[str, float] | None = None
     timestamp: datetime
 
 
 class UploadedFileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     chat_id: int
     filename: str
@@ -138,36 +138,17 @@ def get_current_user(
     return user
 
 
-def chat_to_out(chat: Chat) -> ChatOut:
-    return ChatOut(
-        id=chat.id,
-        user_id=chat.user_id,
-        title=chat.title,
-        mode=chat.mode,
-        is_pinned=chat.is_pinned,
-        is_archived=chat.is_archived,
-        created_at=chat.created_at,
-    )
-
-
 def message_to_out(message: Message) -> MessageOut:
-    return MessageOut(
-        id=message.id,
-        chat_id=message.chat_id,
-        role=message.role,
-        content=message.content,
-        timestamp=message.timestamp,
-    )
+    metrics = None
+    if message.metrics_json:
+        try:
+            metrics = json.loads(message.metrics_json)
+        except json.JSONDecodeError:
+            pass
 
-
-def file_to_out(uploaded_file: ModelUploadedFile) -> UploadedFileOut:
-    return UploadedFileOut(
-        id=uploaded_file.id,
-        chat_id=uploaded_file.chat_id,
-        filename=uploaded_file.filename,
-        filepath=uploaded_file.filepath,
-        uploaded_at=uploaded_file.uploaded_at,
-    )
+    out = MessageOut.model_validate(message)
+    out.metrics = metrics
+    return out
 
 
 def get_user_chat_or_404(db: Session, chat_id: int, user_id: int) -> Chat:
@@ -183,7 +164,7 @@ def root():
 
 
 @app.post("/api/auth/register", response_model=UserOut)
-def register(payload: RegisterInput, db: Session = Depends(get_db)):
+def register(payload: AuthInput, db: Session = Depends(get_db)):
     exists = db.query(User).filter(User.username == payload.username).first()
     if exists:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already exists")
@@ -193,11 +174,11 @@ def register(payload: RegisterInput, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    return UserOut(id=user.id, username=user.username)
+    return UserOut.model_validate(user)
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
-def login(payload: LoginInput, db: Session = Depends(get_db)):
+def login(payload: AuthInput, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not check_password_hash(user.password, payload.password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
@@ -208,7 +189,7 @@ def login(payload: LoginInput, db: Session = Depends(get_db)):
 
 @app.get("/api/auth/me", response_model=UserOut)
 def me(current_user: User = Depends(get_current_user)):
-    return UserOut(id=current_user.id, username=current_user.username)
+    return UserOut.model_validate(current_user)
 
 
 @app.get("/api/chats", response_model=list[ChatOut])
@@ -219,7 +200,7 @@ def list_chats(current_user: User = Depends(get_current_user), db: Session = Dep
         .order_by(Chat.is_pinned.desc(), Chat.created_at.desc())
         .all()
     )
-    return [chat_to_out(chat) for chat in chats]
+    return [ChatOut.model_validate(chat) for chat in chats]
 
 
 @app.post("/api/chats", response_model=ChatOut)
@@ -228,20 +209,20 @@ def create_chat(current_user: User = Depends(get_current_user), db: Session = De
     db.add(chat)
     db.commit()
     db.refresh(chat)
-    return chat_to_out(chat)
+    return ChatOut.model_validate(chat)
 
 
 @app.get("/api/chats/{chat_id}", response_model=ChatDetailOut)
 def get_chat(chat_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     chat = get_user_chat_or_404(db, chat_id, current_user.id)
 
-    messages = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.timestamp).all()
+    chat_messages = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.timestamp).all()
     files = db.query(ModelUploadedFile).filter(ModelUploadedFile.chat_id == chat_id).all()
 
     return ChatDetailOut(
-        chat=chat_to_out(chat),
-        messages=[message_to_out(message) for message in messages],
-        files=[file_to_out(uploaded_file) for uploaded_file in files],
+        chat=ChatOut.model_validate(chat),
+        messages=[message_to_out(msg) for msg in chat_messages],
+        files=[UploadedFileOut.model_validate(f) for f in files],
     )
 
 
@@ -261,34 +242,36 @@ def send_message(
     if chat.title == "New Chat":
         chat.title = " ".join(user_input.split()[:6])
 
-    messages = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.timestamp).all()
+    MSG_CLASSES = {"user": HumanMessage, "ai": AIMessage}
+    history_records = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.timestamp).all()
 
     if chat.mode == "rag":
         try:
-            history_dicts = [
-                {"role": msg.role, "content": msg.content}
-                for msg in messages
-            ]
-            ai_text = get_rag_response(chat_id, user_input, history=history_dicts)
+            history_dicts = [{"role": m.role, "content": m.content} for m in history_records]
+            rag_result = get_rag_response(chat_id, user_input, history=history_dicts)
+            ai_text = rag_result["answer"]
+            ai_metrics = rag_result["metrics"]
         except Exception:
             ai_text = "Error retrieving document context. Please check your uploaded file."
+            ai_metrics = None
     else:
-        history = []
-        for msg in messages:
-            if msg.role == "user":
-                history.append(HumanMessage(content=msg.content))
-            else:
-                history.append(AIMessage(content=msg.content))
-
+        history = [MSG_CLASSES.get(m.role, AIMessage)(content=m.content) for m in history_records]
         history.append(HumanMessage(content=user_input))
         try:
             ai_response = get_response(history)
             ai_text = ai_response.content
+            ai_metrics = None
         except Exception:
             ai_text = "AI service is not configured. Please set GROQ_API_KEY on the server."
+            ai_metrics = None
 
     db.add(Message(chat_id=chat_id, role="user", content=user_input))
-    ai_message = Message(chat_id=chat_id, role="ai", content=ai_text)
+    ai_message = Message(
+        chat_id=chat_id,
+        role="ai",
+        content=ai_text,
+        metrics_json=json.dumps(ai_metrics) if ai_metrics else None,
+    )
     db.add(ai_message)
     db.commit()
     db.refresh(ai_message)
@@ -309,7 +292,7 @@ async def upload_file(
     if not filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
 
-    filepath = os.path.join(UPLOAD_FOLDER, f"{chat_id}_{filename}")
+    filepath = os.path.join(Config.UPLOAD_DIR, f"{chat_id}_{filename}")
 
     content = await file.read()
     with open(filepath, "wb") as out_file:
@@ -332,7 +315,7 @@ async def upload_file(
     db.commit()
     db.refresh(uploaded)
 
-    return file_to_out(uploaded)
+    return UploadedFileOut.model_validate(uploaded)
 
 
 @app.post("/api/chats/{chat_id}/pin", response_model=ChatOut)
@@ -341,7 +324,7 @@ def pin_chat(chat_id: int, current_user: User = Depends(get_current_user), db: S
     chat.is_pinned = not chat.is_pinned
     db.commit()
     db.refresh(chat)
-    return chat_to_out(chat)
+    return ChatOut.model_validate(chat)
 
 
 @app.post("/api/chats/{chat_id}/archive", response_model=ChatOut)
@@ -350,7 +333,7 @@ def archive_chat(chat_id: int, current_user: User = Depends(get_current_user), d
     chat.is_archived = True
     db.commit()
     db.refresh(chat)
-    return chat_to_out(chat)
+    return ChatOut.model_validate(chat)
 
 
 @app.delete("/api/chats/{chat_id}")
@@ -365,7 +348,7 @@ def delete_chat(chat_id: int, current_user: User = Depends(get_current_user), db
             except OSError:
                 pass
 
-    clear_chat_rag_data(chat_id)
+    clear_rag_data(chat_id)
 
     db.query(Message).filter(Message.chat_id == chat_id).delete()
     db.query(ModelUploadedFile).filter(ModelUploadedFile.chat_id == chat_id).delete()

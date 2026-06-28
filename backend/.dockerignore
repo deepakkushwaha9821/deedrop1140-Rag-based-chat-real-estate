@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.vscode/
+frontend/node_modules/
+frontend/dist/
+instance/
+uploads/
+vectorstores/
+database.db

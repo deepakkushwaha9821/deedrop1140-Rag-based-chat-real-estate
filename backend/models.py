@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 try:
@@ -39,7 +40,7 @@ class Chat(Base):
     is_pinned = Column(Boolean, default=False)
     is_archived = Column(Boolean, default=False)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="chats")
     messages = relationship("Message", back_populates="chat", cascade="all, delete-orphan")
@@ -54,7 +55,8 @@ class Message(Base):
 
     role = Column(String(50), nullable=False)
     content = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    metrics_json = Column(Text, nullable=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     chat = relationship("Chat", back_populates="messages")
 
@@ -67,10 +69,17 @@ class UploadedFile(Base):
 
     filename = Column(String(200), nullable=False)
     filepath = Column(String(300), nullable=False)
-    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    uploaded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     chat = relationship("Chat", back_populates="files")
 
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+
+    # One-off migration: add metrics_json if missing from older databases.
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE message ADD COLUMN metrics_json TEXT"))
+    except OperationalError:
+        pass  # Column already exists

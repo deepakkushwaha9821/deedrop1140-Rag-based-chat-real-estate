@@ -17,12 +17,7 @@ class Config:
     SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'database.db'}")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-    # Groq LLaMA model — override via GROQ_MODEL env var
-    # Available models:
-    #   llama-3.3-70b-versatile      ← best quality (default)
-    #   llama-3.1-70b-versatile      ← LLaMA 3.1 large
-    #   llama-3.1-8b-instant         ← fastest / lowest cost
-    #   llama3-70b-8192              ← legacy
+    # Override via GROQ_MODEL env var (default: llama-3.3-70b-versatile)
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080"))

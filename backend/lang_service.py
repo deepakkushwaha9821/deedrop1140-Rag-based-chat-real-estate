@@ -1,7 +1,11 @@
 import os
 import shutil
+import math
+import re
+from functools import lru_cache
 from importlib import import_module
 from typing import Any
+from collections import Counter
 
 import numpy as np
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -19,16 +23,16 @@ from rapidocr_onnxruntime import RapidOCR
 from sentence_transformers import CrossEncoder
 
 try:
-    from .config import Config
-except ImportError:
     from config import Config
+except ImportError:
+    from .config import Config
 
 VECTOR_STORE_PATH = Config.VECTORSTORE_DIR
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".log", ".rst"}
 
 
-def get_ensemble_retriever_class():
+def _get_ensemble_cls():
     for module_name in ("langchain.retrievers", "langchain_classic.retrievers"):
         try:
             module = import_module(module_name)
@@ -37,43 +41,39 @@ def get_ensemble_retriever_class():
             continue
     raise ImportError("EnsembleRetriever not found in installed LangChain packages")
 
-# ── Singleton embedding model (cached) ──────────────────────────────────────
-_embeddings = None
 
+@lru_cache(maxsize=1)
 def get_embeddings():
-    global _embeddings
-    if _embeddings is None:
-        _embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
-    return _embeddings
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
-# ── Singleton cross-encoder re-ranker ───────────────────────────────────────
-_reranker = None
-_ocr_engine = None
 
+@lru_cache(maxsize=1)
 def get_reranker():
-    global _reranker
-    if _reranker is None:
-        _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    return _reranker
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
-def get_ocr_engine():
-    global _ocr_engine
-    if _ocr_engine is None:
-        _ocr_engine = RapidOCR()
-    return _ocr_engine
+@lru_cache(maxsize=1)
+def _get_ocr():
+    return RapidOCR()
 
 
-# ── In-memory doc cache for BM25 (per chat_id) ──────────────────────────────
-_docs_cache: dict = {}
+# In-memory doc cache for BM25 (per chat_id)
+_docs_cache: dict[int, list[Document]] = {}
+
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
+    "he", "her", "his", "i", "in", "is", "it", "its", "me", "my", "of", "on",
+    "or", "our", "she", "that", "the", "their", "them", "they", "this", "to", "was",
+    "we", "were", "what", "when", "where", "which", "who", "why", "will", "with", "you",
+}
 
 
-def _extract_ocr_lines(ocr_result: Any) -> list[str]:
+def _ocr_lines(ocr_result: Any) -> list[str]:
     lines: list[str] = []
     if not ocr_result:
         return lines
@@ -86,16 +86,108 @@ def _extract_ocr_lines(ocr_result: Any) -> list[str]:
     return lines
 
 
-def _ocr_text_from_pil_image(image: Image.Image) -> str:
+def _tokenize(text: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 2 and token not in _STOPWORDS]
+
+
+def _safe_div(numerator: float, denominator: float) -> float:
+    return round(numerator / denominator, 4) if denominator else 0.0
+
+
+def _jaccard(tokens_a: set[str], tokens_b: set[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return round(len(tokens_a & tokens_b) / len(tokens_a | tokens_b), 4)
+
+
+def _cosine_sim(text_a: str, text_b: str) -> float:
+    tokens_a = _tokenize(text_a)
+    tokens_b = _tokenize(text_b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+
+    counts_a = Counter(tokens_a)
+    counts_b = Counter(tokens_b)
+    common = set(counts_a) & set(counts_b)
+    numerator = sum(counts_a[token] * counts_b[token] for token in common)
+    norm_a = math.sqrt(sum(value * value for value in counts_a.values()))
+    norm_b = math.sqrt(sum(value * value for value in counts_b.values()))
+    if not norm_a or not norm_b:
+        return 0.0
+    return round(numerator / (norm_a * norm_b), 4)
+
+
+def _doc_score(query_tokens: set[str], doc_text: str) -> float:
+    doc_tokens = set(_tokenize(doc_text))
+    if not query_tokens or not doc_tokens:
+        return 0.0
+    return len(query_tokens & doc_tokens) / len(query_tokens)
+
+
+def _calc_metrics(query: str, answer: str, docs: list) -> dict[str, float]:
+    context_text = "\n\n".join(doc.page_content for doc in docs)
+    query_tokens = set(_tokenize(query))
+    answer_tokens = _tokenize(answer)
+
+    doc_scores = [_doc_score(query_tokens, doc.page_content) for doc in docs]
+    relevance_threshold = 0.15 if query_tokens else 0.0
+    labels = [1 if score >= relevance_threshold else 0 for score in doc_scores]
+
+    relevant_docs = sum(labels)
+    retrieved_docs = len(docs)
+    possible_relevant_docs = max(1, sum(1 for score in doc_scores if score > 0))
+
+    first_relevant_rank = next((index + 1 for index, label in enumerate(labels) if label), None)
+    precision_at_k = _safe_div(relevant_docs, retrieved_docs)
+    recall_at_k = _safe_div(relevant_docs, possible_relevant_docs)
+    mrr = round(1 / first_relevant_rank, 4) if first_relevant_rank else 0.0
+
+    precision_sum = 0.0
+    hit_count = 0
+    for index, label in enumerate(labels, start=1):
+        if label:
+            hit_count += 1
+            precision_sum += hit_count / index
+    map_score = _safe_div(precision_sum, possible_relevant_docs)
+
+    dcg = sum(label / math.log2(index + 1) for index, label in enumerate(labels, start=1))
+    ideal_labels = sorted(labels, reverse=True)
+    idcg = sum(label / math.log2(index + 1) for index, label in enumerate(ideal_labels, start=1))
+    ndcg = _safe_div(dcg, idcg)
+
+    supported_tokens = sum(1 for token in answer_tokens if token in set(_tokenize(context_text)))
+    faithfulness = _safe_div(supported_tokens, len(answer_tokens))
+    answer_relevancy = _jaccard(set(answer_tokens), query_tokens)
+    semantic_similarity = _cosine_sim(answer, context_text)
+    correctness = round((faithfulness + answer_relevancy + semantic_similarity) / 3, 4)
+    hallucination_rate = round(max(0.0, 1.0 - faithfulness), 4)
+
+    return {
+        "context_precision": precision_at_k,
+        "context_recall": recall_at_k,
+        "precision_at_k": precision_at_k,
+        "recall_at_k": recall_at_k,
+        "mrr": mrr,
+        "map": map_score,
+        "ndcg": ndcg,
+        "faithfulness": faithfulness,
+        "answer_relevancy": answer_relevancy,
+        "correctness": correctness,
+        "hallucination_rate": hallucination_rate,
+        "semantic_similarity": semantic_similarity,
+    }
+
+
+def _ocr_from_image(image: Image.Image) -> str:
     rgb_image = image.convert("RGB")
-    result, _ = get_ocr_engine()(np.array(rgb_image))
-    lines = _extract_ocr_lines(result)
+    result, _ = _get_ocr()(np.array(rgb_image))
+    lines = _ocr_lines(result)
     return "\n".join(lines).strip()
 
 
-def _load_image_documents(filepath: str) -> list[Document]:
+def _load_image_docs(filepath: str) -> list[Document]:
     with Image.open(filepath) as image:
-        text = _ocr_text_from_pil_image(image)
+        text = _ocr_from_image(image)
         description = f"Image file: {os.path.basename(filepath)} ({image.width}x{image.height})"
 
     if text:
@@ -106,7 +198,7 @@ def _load_image_documents(filepath: str) -> list[Document]:
     return [Document(page_content=content, metadata={"source": filepath, "ocr": True, "type": "image"})]
 
 
-def _load_pdf_documents(filepath: str) -> list[Document]:
+def _load_pdf_docs(filepath: str) -> list[Document]:
     documents = PyPDFLoader(filepath).load()
     if any(doc.page_content.strip() for doc in documents):
         return documents
@@ -123,7 +215,7 @@ def _load_pdf_documents(filepath: str) -> list[Document]:
         page = pdf[page_index]
         bitmap = page.render(scale=2)
         image = bitmap.to_pil()
-        text = _ocr_text_from_pil_image(image)
+        text = _ocr_from_image(image)
         if text:
             ocr_docs.append(
                 Document(
@@ -138,7 +230,7 @@ def _load_pdf_documents(filepath: str) -> list[Document]:
     return ocr_docs
 
 
-def clear_chat_rag_data(chat_id: int):
+def clear_rag_data(chat_id: int):
     # Drop in-memory sparse retrieval cache for the deleted chat.
     _docs_cache.pop(chat_id, None)
 
@@ -148,14 +240,14 @@ def clear_chat_rag_data(chat_id: int):
         shutil.rmtree(persist_path, ignore_errors=True)
 
 
-# ── CREATE VECTOR STORE ──────────────────────────────────────────────────────
+
 def create_vectorstore(filepath: str, chat_id: int):
     ext = os.path.splitext(filepath)[1].lower()
 
     if ext == ".pdf":
-        documents = _load_pdf_documents(filepath)
+        documents = _load_pdf_docs(filepath)
     elif ext in SUPPORTED_IMAGE_EXTENSIONS:
-        documents = _load_image_documents(filepath)
+        documents = _load_image_docs(filepath)
     elif ext in SUPPORTED_TEXT_EXTENSIONS:
         loader = TextLoader(filepath, encoding="utf-8", autodetect_encoding=True)
         documents = loader.load()
@@ -189,7 +281,7 @@ def create_vectorstore(filepath: str, chat_id: int):
     )
 
 
-# ── RE-RANK ──────────────────────────────────────────────────────────────────
+
 def rerank_docs(query: str, docs: list, top_k: int = 3) -> list:
     if len(docs) <= top_k:
         return docs
@@ -199,8 +291,8 @@ def rerank_docs(query: str, docs: list, top_k: int = 3) -> list:
     return [doc for _, doc in ranked[:top_k]]
 
 
-# ── GET RAG RESPONSE ─────────────────────────────────────────────────────────
-def get_rag_response(chat_id: int, query: str, history: list = None) -> str:
+
+def get_rag_response(chat_id: int, query: str, history: list = None) -> dict[str, Any]:
     persist_path = os.path.join(VECTOR_STORE_PATH, str(chat_id))
 
     if not Config.GROQ_API_KEY:
@@ -221,7 +313,7 @@ def get_rag_response(chat_id: int, query: str, history: list = None) -> str:
     if cached_docs:
         bm25 = BM25Retriever.from_documents(cached_docs)
         bm25.k = 6
-        EnsembleRetriever = get_ensemble_retriever_class()
+        EnsembleRetriever = _get_ensemble_cls()
         retriever = EnsembleRetriever(
             retrievers=[bm25, dense_retriever],
             weights=[0.4, 0.6],
@@ -279,4 +371,10 @@ Answer:"""
         | StrOutputParser()
     )
 
-    return rag_chain.invoke(query)
+    answer = rag_chain.invoke(query)
+    metrics = _calc_metrics(query, answer, top_docs)
+
+    return {
+        "answer": answer,
+        "metrics": metrics,
+    }

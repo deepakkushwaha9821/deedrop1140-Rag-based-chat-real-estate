@@ -1,31 +1,29 @@
+from functools import lru_cache
+
 from langchain_groq import ChatGroq
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph
-from typing import TypedDict, List
+from typing import TypedDict
 
 try:
     from .config import Config
 except ImportError:
     from config import Config
 
-llm = None
 
-
+@lru_cache(maxsize=1)
 def get_llm():
-    global llm
-    if llm is None:
-        if not Config.GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY is not configured")
-        llm = ChatGroq(
-            groq_api_key=Config.GROQ_API_KEY,
-            model="llama-3.1-8b-instant",
-            temperature=0.2,
-        )
-    return llm
+    if not Config.GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+    return ChatGroq(
+        groq_api_key=Config.GROQ_API_KEY,
+        model="llama-3.1-8b-instant",
+        temperature=0.2,
+    )
 
 
 class State(TypedDict):
-    messages: List
+    messages: list[HumanMessage | AIMessage | SystemMessage]
 
 
 SYSTEM_PROMPT = (
@@ -33,9 +31,9 @@ SYSTEM_PROMPT = (
     "You help users with property search, market analysis, investment advice, "
     "legal document Q&A, lead qualification, and client interaction. "
     "When recommending properties, ask clarifying questions about budget, location, and preferences. "
-    "Be professional, concise, and helpful. Do not repeat your previous response verbatim."
-    "if any one give doucmnet that is not related to real estate, you should read the doucment in more detail and give full information to user, and you should not say you need more document information. "
-    "don't  hesitate to provide detailed information from the document, even if it's not directly related to real estate. Your goal is to be as informative and helpful as possible based on the provided context."
+    "Be professional, concise, and helpful. Do not repeat your previous response verbatim. "
+    "If anyone gives a document that is not related to real estate, you should read the document in more detail and give full information to user, and you should not say you need more document information. "
+    "Don't hesitate to provide detailed information from the document, even if it's not directly related to real estate. Your goal is to be as informative and helpful as possible based on the provided context."
 )
 
 
